@@ -1,3 +1,195 @@
+import os, sqlite3, logging
+from urllib.parse import urlparse
+from datetime import datetime, timezone
+import discord
+from discord import app_commands
+from discord.ext import commands
+from dotenv import load_dotenv
+
+load_dotenv()
+TOKEN = os.getenv('DISCORD_TOKEN', '').strip()
+DATABASE_PATH = os.getenv('DATABASE_PATH', 'wss_feedback.sqlite3')
+GUILD_ID = os.getenv('GUILD_ID', '').strip()
+DEFAULT_RAID_CHANNEL_ID = 1504635802594967583
+DEFAULT_BOOST_CHANNEL_ID = 1476283095341596762
+GOLD = discord.Colour.from_rgb(230, 170, 35)
+LOGO_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'wss.jpg')
+ANONYMITY_NOTE = 'Client identity protected'
+logging.basicConfig(level=logging.INFO)
+log = logging.getLogger('wss-feedback')
+
+
+def connect():
+    con = sqlite3.connect(DATABASE_PATH)
+    con.row_factory = sqlite3.Row
+    return con
+
+
+def init_db():
+    with connect() as con:
+        con.execute('''CREATE TABLE IF NOT EXISTS settings (
+            guild_id INTEGER PRIMARY KEY, moderation_channel_id INTEGER,
+            raid_channel_id INTEGER, boost_channel_id INTEGER)''')
+        cols = {r['name'] for r in con.execute('PRAGMA table_info(settings)')}
+        for col in ('moderation_channel_id', 'raid_channel_id', 'boost_channel_id'):
+            if col not in cols:
+                con.execute(f'ALTER TABLE settings ADD COLUMN {col} INTEGER')
+        con.execute('''CREATE TABLE IF NOT EXISTS feedback (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, guild_id INTEGER NOT NULL,
+            user_id INTEGER NOT NULL, category TEXT NOT NULL DEFAULT 'boost',
+            booster TEXT NOT NULL, service TEXT NOT NULL, rating INTEGER NOT NULL,
+            comment TEXT NOT NULL, created_at TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'pending', review_message_id INTEGER,
+            published_message_id INTEGER, decided_by INTEGER, decided_at TEXT)''')
+        cols = {r['name'] for r in con.execute('PRAGMA table_info(feedback)')}
+        migrations = {
+            'category': "ALTER TABLE feedback ADD COLUMN category TEXT NOT NULL DEFAULT 'boost'",
+            'status': "ALTER TABLE feedback ADD COLUMN status TEXT NOT NULL DEFAULT 'pending'",
+            'review_message_id': 'ALTER TABLE feedback ADD COLUMN review_message_id INTEGER',
+            'published_message_id': 'ALTER TABLE feedback ADD COLUMN published_message_id INTEGER',
+            'decided_by': 'ALTER TABLE feedback ADD COLUMN decided_by INTEGER',
+            'decided_at': 'ALTER TABLE feedback ADD COLUMN decided_at TEXT',
+            'image_url': 'ALTER TABLE feedback ADD COLUMN image_url TEXT',
+        }
+        for col, sql in migrations.items():
+            if col not in cols:
+                con.execute(sql)
+
+        # Remove the legacy one-review-per-user constraint while preserving old records.
+        table_sql_row = con.execute(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='feedback'"
+        ).fetchone()
+        table_sql = (table_sql_row['sql'] or '').replace(' ', '').replace('\\n', '').lower() if table_sql_row else ''
+        if 'unique(guild_id,user_id)' in table_sql:
+            con.execute('ALTER TABLE feedback RENAME TO feedback_old')
+            con.execute('''CREATE TABLE feedback (
+                id INTEGER PRIMARY KEY AUTOINCREMENT, guild_id INTEGER NOT NULL,
+                user_id INTEGER NOT NULL, category TEXT NOT NULL DEFAULT 'boost',
+                booster TEXT NOT NULL, service TEXT NOT NULL, rating INTEGER NOT NULL,
+                comment TEXT NOT NULL, created_at TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'pending', review_message_id INTEGER,
+                published_message_id INTEGER, decided_by INTEGER, decided_at TEXT,
+                image_url TEXT)''')
+            con.execute('''INSERT INTO feedback
+                (id,guild_id,user_id,category,booster,service,rating,comment,created_at,
+                 status,review_message_id,published_message_id,decided_by,decided_at,image_url)
+                SELECT id,guild_id,user_id,category,booster,service,rating,comment,created_at,
+                       status,review_message_id,published_message_id,decided_by,decided_at,image_url
+                FROM feedback_old''')
+            con.execute('DROP TABLE feedback_old')
+
+
+def channels_for(guild_id):
+    with connect() as con:
+        row = con.execute('SELECT * FROM settings WHERE guild_id=?', (guild_id,)).fetchone()
+    if not row:
+        return None, DEFAULT_RAID_CHANNEL_ID, DEFAULT_BOOST_CHANNEL_ID
+    return (row['moderation_channel_id'], row['raid_channel_id'] or DEFAULT_RAID_CHANNEL_ID,
+            row['boost_channel_id'] or DEFAULT_BOOST_CHANNEL_ID)
+
+
+def get_review(review_id):
+    with connect() as con:
+        return con.execute('SELECT * FROM feedback WHERE id=?', (review_id,)).fetchone()
+
+
+def valid_image_url(value):
+    value = (value or '').strip()
+    if not value:
+        return None
+    parsed = urlparse(value)
+    if parsed.scheme not in ('http', 'https') or not parsed.netloc:
+        return None
+    return value
+
+
+def review_embed(row, preview=False):
+    rating = max(1, min(5, int(row['rating'])))
+    category = 'RAID FEEDBACK' if row['category'] == 'raid' else 'BOOST FEEDBACK'
+    created_at = datetime.fromisoformat(row['created_at'])
+    embed = discord.Embed(
+        title=f'⭐ WSS SERVICE — {category}',
+        description=(
+            f'👤 **From:** Anonymous *({ANONYMITY_NOTE})*\n'
+            f'🛡️ **Booster:** {discord.utils.escape_markdown(row["booster"])}\n'
+            f'⭐ **Rating:** {"⭐" * rating}{"☆" * (5-rating)} **{rating}/5**\n'
+            f'⚔️ **Service:** {discord.utils.escape_markdown(row["service"])}\n\n'
+            f'💬 **Comment**\n{discord.utils.escape_markdown(row["comment"])}'
+        ),
+        colour=GOLD,
+        timestamp=created_at,
+    )
+    image_url = valid_image_url(row['image_url'] if 'image_url' in row.keys() else None)
+    if image_url:
+        embed.set_thumbnail(url=image_url)
+    embed.set_footer(text='🏆 WSS BOOST & SERVICE • ' + ('Awaiting approval' if preview else category.title()))
+    if os.path.isfile(LOGO_PATH):
+        embed.set_author(name='WSS SERVICE — Feedback', icon_url='attachment://wss.jpg')
+    else:
+        embed.set_author(name='WSS SERVICE — Feedback')
+    return embed
+
+
+def logo_file():
+    """Return a fresh logo attachment when the original WSS image is present."""
+    if os.path.isfile(LOGO_PATH):
+        return discord.File(LOGO_PATH, filename='wss.jpg')
+    return None
+
+
+async def remove_from_moderation_queue(interaction, review_id, result_label):
+    """Delete a processed moderation post; if Discord refuses, hide the review card and log why."""
+    message = interaction.message
+    if message is None:
+        log.error('No interaction message available to remove review %s from queue', review_id)
+        return
+    try:
+        await message.delete()
+        log.info('Removed review %s from moderation queue (%s)', review_id, result_label)
+    except discord.NotFound:
+        log.info('Moderation message for review %s was already deleted', review_id)
+    except discord.Forbidden:
+        log.exception('Discord denied deletion of moderation message for review %s; check bot permissions', review_id)
+        try:
+            await message.edit(
+                content=f'✅ Review #{review_id} {result_label} — removed from the active queue.',
+                embed=None,
+                attachments=[],
+                view=None,
+            )
+        except discord.HTTPException:
+            log.exception('Could not replace processed moderation message for review %s', review_id)
+    except discord.HTTPException:
+        log.exception('Could not delete moderation message for review %s', review_id)
+        try:
+            await message.edit(
+                content=f'✅ Review #{review_id} {result_label} — removed from the active queue.',
+                embed=None,
+                attachments=[],
+                view=None,
+            )
+        except discord.HTTPException:
+            log.exception('Could not replace processed moderation message for review %s', review_id)
+
+
+class DecisionView(discord.ui.View):
+    def __init__(self, review_id):
+        super().__init__(timeout=None)
+        self.review_id = review_id
+        self.approve.custom_id = f'wss:approve:{review_id}'
+        self.reject.custom_id = f'wss:reject:{review_id}'
+
+    async def interaction_check(self, interaction):
+        if not interaction.user.guild_permissions.manage_guild:
+            await interaction.response.send_message('Only staff with **Manage Server** permission can decide.', ephemeral=True)
+            return False
+        return True
+
+    @discord.ui.button(label='Publish review', style=discord.ButtonStyle.success, emoji='✅')
+    async def approve(self, interaction, button):
+        row = get_review(self.review_id)
+        if not row or row['status'] != 'pending':
+            await interaction.response.send_message('This review has already been processed.', ephemeral=True)
             return
         _, raid_id, boost_id = channels_for(row['guild_id'])
         target_id = raid_id if row['category'] == 'raid' else boost_id
@@ -190,3 +382,23 @@ async def feedback_stats(interaction: discord.Interaction):
         return
     with connect() as con:
         row = con.execute("SELECT COUNT(*) total, SUM(status='approved') approved, SUM(status='pending') pending, AVG(CASE WHEN status='approved' THEN rating END) average FROM feedback WHERE guild_id=?", (interaction.guild.id,)).fetchone()
+    await interaction.response.send_message(f"**WSS Feedback Stats**\nSubmissions: **{row['total'] or 0}**\nPublished: **{row['approved'] or 0}**\nPending: **{row['pending'] or 0}**\nAverage published rating: **{float(row['average'] or 0):.2f}/5**", ephemeral=True)
+
+@feedback_setup.error
+@feedback_stats.error
+async def command_error(interaction, error):
+    if isinstance(error, app_commands.MissingPermissions):
+        message = 'You need **Manage Server** permission to use this command.'
+    else:
+        log.exception('Slash command failed', exc_info=error)
+        message = 'Something went wrong. Check the bot console.'
+    if interaction.response.is_done():
+        await interaction.followup.send(message, ephemeral=True)
+    else:
+        await interaction.response.send_message(message, ephemeral=True)
+
+if __name__ == '__main__':
+    init_db()
+    if not TOKEN:
+        raise RuntimeError('DISCORD_TOKEN is missing. Copy .env.example to .env and add your bot token.')
+    bot.run(TOKEN)
